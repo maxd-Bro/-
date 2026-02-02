@@ -1,0 +1,542 @@
+import React, { useState, useMemo, useRef, useEffect } from 'react';
+import {
+    Settings,
+    FileText,
+    Layers,
+    Printer,
+    TrendingUp,
+    Box,
+    Layout,
+    Scissors,
+    CheckCircle2,
+    BarChart3,
+    Upload,
+    FileCode,
+    Check,
+    X,
+    Target,
+    Ruler,
+    Download,
+    MoveHorizontal,
+    Maximize2,
+    AlertTriangle,
+    Info,
+    BoxSelect,
+    MousePointer2,
+    Lock,
+    ChevronDown,
+    Package,
+    History,
+    Save,
+    Trash2,
+    Cloud,
+    RotateCw,
+    Cpu,
+    ArrowRightLeft,
+    LayoutGrid,
+    Zap
+} from 'lucide-react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken } from 'firebase/auth';
+import { getFirestore, collection, doc, setDoc, getDoc, onSnapshot, query, addDoc, deleteDoc, Timestamp } from 'firebase/firestore';
+
+// --- Firebase 初始化 ---
+const firebaseConfig = JSON.parse(__firebase_config);
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getFirestore(app);
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'imposition-system-v8';
+
+const PAPER_SIZES = [
+    { id: 'G1K_STD', name: '菊全開 (標準)', width: 889, height: 635, group: '菊版' },
+    { id: 'B1K_STD', name: '四六全 (標準)', width: 788, height: 1030, group: '四六版' },
+    { id: 'G1K_MAX', name: '特大版 (大菊全)', width: 889, height: 1190, group: '特規版' },
+    { id: 'CUSTOM', name: '自訂規格 (MM)', width: 500, height: 500, group: '自訂' },
+];
+
+// --- 輔助函式：產生座標歸一化的實體刀路 ---
+// 線條已調細：strokeWidth 預設 0.5pt
+const getNormalizedBoxPaths = (l, w, h, hasTongue, glueSide, strokeColor = "#00E676", strokeWidth = "0.5pt") => {
+    const glueW = 15;
+    const flapH = w * 0.8;
+    const gX = glueSide === 'right' ? (l + w) * 2 : 0;
+
+    const common = `fill="none" stroke="${strokeColor}" stroke-width="${strokeWidth}"`;
+
+    // 頂部插舌路徑 (頂點在 y=0)
+    const topFlapPath = `M 0 ${flapH} L ${l * 0.15} ${flapH * 0.2} Q ${l * 0.5} ${hasTongue ? -10 : 0} ${l * 0.85} ${flapH * 0.2} L ${l} ${flapH}`;
+    // 底部插舌路徑
+    const bottomFlapPath = `M 0 0 L ${l * 0.15} ${flapH * 0.8} Q ${l * 0.5} ${flapH + (hasTongue ? 10 : 0)} ${l * 0.85} ${flapH * 0.8} L ${l} 0`;
+
+    return `
+    <rect x="${glueSide === 'left' ? glueW : 0}" y="${flapH}" width="${l}" height="${h}" ${common} />
+    <rect x="${(glueSide === 'left' ? glueW : 0) + l}" y="${flapH}" width="${w}" height="${h}" ${common} />
+    <rect x="${(glueSide === 'left' ? glueW : 0) + l + w}" y="${flapH}" width="${l}" height="${h}" ${common} />
+    <rect x="${(glueSide === 'left' ? glueW : 0) + l * 2 + w}" y="${flapH}" width="${w}" height="${h}" ${common} />
+    <rect x="${gX}" y="${flapH}" width="${glueW}" height="${h}" stroke-dasharray="2,2" ${common} />
+    <g transform="translate(${glueSide === 'left' ? glueW : 0}, 0)"><path d="${topFlapPath}" ${common} /></g>
+    <g transform="translate(${(glueSide === 'left' ? glueW : 0) + l + w}, ${h + flapH})"><path d="${bottomFlapPath}" ${common} /></g>
+  `;
+};
+
+const BoxDieline = ({ scale, isFlipped, isItemRotated, params, detailSettings, importedSvg }) => {
+    const { l, w, h } = params;
+    const { hasTongue, glueSide } = detailSettings;
+    const s = scale;
+
+    if (importedSvg && importedSvg.rawContent) {
+        const visualW = isItemRotated ? importedSvg.heightMM : importedSvg.widthMM;
+        const visualH = isItemRotated ? importedSvg.widthMM : importedSvg.heightMM;
+        return (
+            <div style={{
+                width: visualW * s, height: visualH * s,
+                transform: isFlipped ? 'rotate(180deg)' : 'none',
+                display: 'flex', alignItems: 'center', justifyContent: 'center', transition: 'all 0.3s ease'
+            }}>
+                <svg width="100%" height="100%" viewBox={importedSvg.viewBox} style={{ overflow: 'visible', transform: isItemRotated ? 'rotate(90deg)' : 'none' }} fill="none">
+                    <style>{`path, line, rect, polyline, circle, polygon { stroke: ${isFlipped ? "#00C853" : "#00E676"} !important; stroke-width: 1.8px !important; fill: none !important; vector-effect: non-scaling-stroke; }`}</style>
+                    <g dangerouslySetInnerHTML={{ __html: importedSvg.rawContent }} />
+                </svg>
+            </div>
+        );
+    }
+
+    const flapH = w * 0.8;
+    const totalW = (l + w) * 2 + 15;
+    const totalH = h + flapH * 2;
+    const visualW = isItemRotated ? totalH : totalW;
+    const visualH = isItemRotated ? totalW : totalH;
+
+    return (
+        <div style={{ transform: isFlipped ? 'rotate(180deg)' : 'none', transition: 'transform 0.3s ease' }}>
+            <svg width={visualW * s} height={visualH * s} viewBox={`0 0 ${visualW} ${visualH}`} className="overflow-visible">
+                <g transform={isItemRotated ? `rotate(90, ${visualW / 2}, ${visualH / 2}) translate(${(visualW - totalW) / 2}, ${(visualH - totalH) / 2})` : ''}>
+                    <g dangerouslySetInnerHTML={{ __html: getNormalizedBoxPaths(l, w, h, hasTongue, glueSide, isFlipped ? "#00C853" : "#00E676", "1.8px") }} />
+                </g>
+            </svg>
+        </div>
+    );
+};
+
+const App = () => {
+    const [mode, setMode] = useState('manual');
+    const [struct, setStruct] = useState({ l: 50, w: 60, h: 70 });
+    const [details, setDetails] = useState({ hasTongue: true, glueSide: 'right' });
+    const [paperId, setPaperId] = useState('G1K_STD');
+    const [customPaper, setCustomPaper] = useState({ w: 889, h: 635 });
+    const [minGutter, setMinGutter] = useState(6);
+    const [isInterlocking, setIsInterlocking] = useState(true);
+    const [xShiftManual, setXShiftManual] = useState(0);
+    const [zoom, setZoom] = useState(0.4);
+    const [importedData, setImportedData] = useState(null);
+    const [selectedSolutionIdx, setSelectedSolutionIdx] = useState(0);
+    const [grainDirection, setGrainDirection] = useState('long');
+
+    const [user, setUser] = useState(null);
+    const [versions, setVersions] = useState([]);
+    const [isSaving, setIsSaving] = useState(false);
+    const [saveName, setSaveName] = useState("");
+    const [showSaveModal, setShowSaveModal] = useState(false);
+    const fileInputRef = useRef(null);
+
+    useEffect(() => {
+        const initAuth = async () => {
+            if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                await signInWithCustomToken(auth, __initial_auth_token);
+            } else { await signInAnonymously(auth); }
+        };
+        initAuth();
+        onAuthStateChanged(auth, setUser);
+    }, []);
+
+    useEffect(() => {
+        if (!user) return;
+        return onSnapshot(collection(db, 'artifacts', appId, 'public', 'data', 'imposition_versions'), (snapshot) => {
+            const vList = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+            vList.sort((a, b) => (b.createdAt?.toMillis() || 0) - (a.createdAt?.toMillis() || 0));
+            setVersions(vList);
+        });
+    }, [user]);
+
+    const handleFileUpload = (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = (ev) => {
+            const parser = new DOMParser();
+            const svgElement = parser.parseFromString(ev.target.result, "image/svg+xml").querySelector("svg");
+            if (svgElement) {
+                const viewBox = svgElement.getAttribute("viewBox") || "0 0 500 500";
+                const parts = viewBox.split(/[\s,]+/).map(Number);
+                const ratio = (parts[2] || 500) > 1200 ? (25.4 / 72) : 1;
+                setImportedData({
+                    fileName: file.name, widthMM: (parts[2] || 500) * ratio, heightMM: (parts[3] || 500) * ratio,
+                    viewBox, rawContent: svgElement.innerHTML
+                });
+                setMode('import');
+            }
+        };
+        reader.readAsText(file);
+    };
+
+    const currentPaper = useMemo(() => {
+        if (paperId === 'CUSTOM') return { id: 'CUSTOM', name: '自訂規格', width: customPaper.w, height: customPaper.h };
+        return PAPER_SIZES.find(p => p.id === paperId);
+    }, [paperId, customPaper]);
+
+    // --- 核心拼模演算法 v8.17: 精確處理橫向對插與縱向邊緣 ---
+    const solutions = useMemo(() => {
+        const bleed = 2;
+        const margin = 10;
+        const baseW = mode === 'import' ? (importedData?.widthMM || 0) + (bleed * 2) : (struct.l + struct.w) * 2 + 15 + (bleed * 2);
+        const baseH = mode === 'import' ? (importedData?.heightMM || 0) + (bleed * 2) : (struct.h + struct.w * 1.6) + (bleed * 2);
+
+        const calcFor = (itemW, itemH, isRotated) => {
+            let currentFlapDepth = 0;
+            // 核心邏輯：橫向 (0°) 才判斷插蓋，縱向 (90°) 採邊緣+6mm
+            if (!isRotated) {
+                const panelWidth = mode === 'import' ? itemW * 0.25 : struct.l;
+                const collisionThreshold = panelWidth * 0.3;
+                if (Math.abs(xShiftManual) < collisionThreshold) {
+                    currentFlapDepth = 0; // 0mm 時插舌互撞，不能嵌套
+                } else {
+                    currentFlapDepth = mode === 'import' ? itemH * 0.35 : struct.w * 0.8;
+                }
+            } else {
+                currentFlapDepth = 0; // 縱向並排無嵌套
+            }
+
+            const safeOverlap = isInterlocking ? currentFlapDepth : 0;
+            const yStep = itemH - safeOverlap + minGutter; // 縱向時 safeOverlap=0, yStep = 邊緣+minGutter
+
+            const pW = currentPaper.width - margin * 2;
+            const pH = currentPaper.height - margin * 2;
+            const xShiftComp = Math.abs(xShiftManual);
+
+            const cols = Math.max(0, Math.floor((pW + minGutter - xShiftComp) / (itemW + minGutter)));
+            const rows = itemH <= pH ? 1 + Math.floor((pH - itemH) / yStep) : 0;
+            const total = cols * rows;
+
+            const idealW = cols > 0 ? Math.ceil(cols * (itemW + minGutter) - minGutter + xShiftComp + margin * 2) : 100;
+            const idealH = rows > 0 ? Math.ceil((rows - 1) * yStep + itemH + margin * 2) : 100;
+
+            return {
+                id: isRotated ? 'rotated' : 'normal',
+                name: isRotated ? '縱向拼排 (90°)' : '橫向拼排 (0°)',
+                cols, rows, total, yStep, itemW, itemH, isRotated,
+                idealW, idealH,
+                efficiency: ((total * baseW * baseH) / (currentPaper.width * currentPaper.height) * 100).toFixed(2)
+            };
+        };
+
+        return [calcFor(baseW, baseH, false), calcFor(baseH, baseW, true)];
+    }, [struct, currentPaper.width, currentPaper.height, minGutter, isInterlocking, xShiftManual, mode, importedData]);
+
+    const activeSolution = solutions[selectedSolutionIdx] || solutions[0];
+
+    const lastSelectedIdx = useRef(selectedSolutionIdx);
+    const lastPaperId = useRef(paperId);
+    useEffect(() => {
+        if (paperId === 'CUSTOM' && (lastSelectedIdx.current !== selectedSolutionIdx || lastPaperId.current !== 'CUSTOM')) {
+            setCustomPaper({ w: activeSolution.idealW, h: activeSolution.idealH });
+        }
+        lastSelectedIdx.current = selectedSolutionIdx;
+        lastPaperId.current = paperId;
+    }, [selectedSolutionIdx, paperId, activeSolution.idealW, activeSolution.idealH]);
+
+    // --- 工業級 AI 匯出：解決座標解析與顯示不全問題 ---
+    const exportToAI = () => {
+        const { cols, total, itemW, itemH, yStep, isRotated } = activeSolution;
+
+        // 1. 修正：確保數值型別正確，避免字串運算錯誤
+        const effectiveShift = Number(xShiftManual);
+
+        // 2. 修正 Grid 寬度計算：包含 Shift 的絕對值，確保邊距 (Margin) 計算正確
+        const gridW = cols * (itemW + minGutter) - minGutter + Math.abs(effectiveShift);
+        const gridH = (total / cols - 1) * yStep + itemH;
+
+        const marginX = (currentPaper.width - gridW) / 2;
+        const marginY = (currentPaper.height - gridH) / 2;
+
+        // 內容尺寸 (不含出血)
+        const contentW = mode === 'import' ? importedData.widthMM : (struct.l + struct.w) * 2 + 15;
+        const contentH = mode === 'import' ? importedData.heightMM : struct.h + struct.w * 1.6;
+
+        const svgHeader = `<?xml version="1.0" encoding="utf-8"?>
+<svg version="1.1" xmlns="http://www.w3.org/2000/svg" width="${currentPaper.width}mm" height="${currentPaper.height}mm" viewBox="0 0 ${currentPaper.width} ${currentPaper.height}">
+  <style>.box{fill:none;stroke:#00E676;stroke-width:0.5pt;}.paper{fill:none;stroke:#D1D5DB;stroke-width:0.1pt;}</style>`;
+
+        let content = `\n  <rect class="paper" width="${currentPaper.width}" height="${currentPaper.height}"/>`;
+
+        for (let i = 0; i < total; i++) {
+            const row = Math.floor(i / cols);
+            const col = i % cols;
+            const isFlipped = isInterlocking && row % 2 === 1;
+
+            // 計算 Cell 左上角座標
+            const currentShift = isFlipped ? effectiveShift : 0;
+            const x = marginX + col * (itemW + minGutter) + currentShift;
+            const y = marginY + row * yStep;
+
+            // 修正策略 v4: 巢狀群組結構 (Nested Group Structure)
+            // 將變形拆解為三層獨立的 Group，避免 SVG Transform 矩陣運算在 AI 中的相容性問題
+            // Layer 1 (Outer): 定位到 Cell 中心 (Translation)
+            // Layer 2 (Middle): 旋轉 (Rotation)
+            // Layer 3 (Inner): 將內容中心對齊原點 (Centering)
+
+            const cellCX = x + itemW / 2;
+            const cellCY = y + itemH / 2;
+
+            // 計算內容的半寬高
+            const localCX = contentW / 2;
+            const localCY = contentH / 2;
+
+            let angle = 0;
+            if (isRotated) angle += 90;
+            if (isFlipped) angle += 180;
+
+            // 構建三層結構
+            content += `\n  <g transform="translate(${cellCX.toFixed(4)}, ${cellCY.toFixed(4)})">`; // Layer 1: Move to Position
+            content += `\n    <g transform="rotate(${angle})">`; // Layer 2: Rotate around (0,0)
+            content += `\n      <g transform="translate(-${localCX.toFixed(4)}, -${localCY.toFixed(4)})">`; // Layer 3: Center Content to (0,0)
+
+            if (mode === 'import' && importedData) {
+                // 針對 Import SVG: 移除巢狀 <svg>，使用 Scale 模擬 viewBox
+                const viewBox = importedData.viewBox.split(/[\s,]+/).map(Number);
+                const [vx, vy, vw, vh] = viewBox.length === 4 ? viewBox : [0, 0, 500, 500];
+
+                const scaleX = importedData.widthMM / vw;
+                const scaleY = importedData.heightMM / vh;
+                const translateX = -vx * scaleX;
+                const translateY = -vy * scaleY;
+
+                content += `\n        <g transform="translate(${translateX.toFixed(4)}, ${translateY.toFixed(4)}) scale(${scaleX.toFixed(5)}, ${scaleY.toFixed(5)})">
+                    <g style="fill:none; stroke:#00E676; stroke-width:${(0.5 / scaleX).toFixed(4)}pt;">${importedData.rawContent}</g>
+                </g>`;
+            } else {
+                content += `\n        ${getNormalizedBoxPaths(struct.l, struct.w, struct.h, details.hasTongue, details.glueSide, "#00E676", "0.5pt")}`;
+            }
+
+            content += `\n      </g>`; // End Layer 3
+            content += `\n    </g>`;   // End Layer 2
+            content += `\n  </g>`;     // End Layer 1
+        }
+
+        const fullSvg = svgHeader + content + "\n</svg>";
+        const blob = new Blob([fullSvg], { type: 'image/svg+xml;charset=utf-8' });
+        const link = document.createElement('a');
+        link.href = URL.createObjectURL(blob);
+        link.download = `DrawStar_v8.26_Nested_Group.svg`;
+        link.click();
+    };
+
+    const saveCurrentVersion = async () => {
+        if (!saveName || !user) return;
+        setIsSaving(true);
+        try {
+            await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'imposition_versions'), {
+                name: saveName, createdAt: Timestamp.now(),
+                mode, struct, details, paperId, customPaper, minGutter, isInterlocking, xShiftManual,
+                importedData: mode === 'import' ? importedData : null, totalYield: activeSolution.total,
+                selectedSolutionIdx
+            });
+            setShowSaveModal(false); setSaveName("");
+        } catch (err) { console.error(err); } finally { setIsSaving(false); }
+    };
+
+    const loadVersion = (v) => {
+        setMode(v.mode); setStruct(v.struct); setDetails(v.details); setPaperId(v.paperId);
+        if (v.customPaper) setCustomPaper(v.customPaper); setMinGutter(v.minGutter);
+        setIsInterlocking(v.isInterlocking); setXShiftManual(v.xShiftManual);
+        if (v.selectedSolutionIdx !== undefined) setSelectedSolutionIdx(v.selectedSolutionIdx);
+        if (v.mode === 'import') setImportedData(v.importedData);
+    };
+
+    return (
+        <div className="flex flex-col h-screen bg-[#050505] text-slate-300 font-sans text-sm overflow-hidden text-[11px]">
+            <header className="bg-[#111] border-b border-white/5 px-6 py-4 flex justify-between items-center shadow-2xl z-50">
+                <div className="flex items-center gap-5">
+                    <div className="bg-[#00ff88] p-2 rounded-2xl shadow-[0_0_20px_rgba(0,255,136,0.5)]"><Zap size={26} className="text-black fill-current" /></div>
+                    <div>
+                        <h1 className="text-xl font-black text-white tracking-tighter italic uppercase leading-none mb-1 text-blue-50">DrawStar <span className="text-[#00ff88]">v8.17-PRO</span></h1>
+                        <div className="flex items-center gap-2 text-[10px] text-slate-500 font-black uppercase tracking-widest italic font-mono">
+                            <Cpu size={12} className="text-[#00ff88]" /> 雙向排版自動吸附引擎：運作中
+                        </div>
+                    </div>
+                </div>
+                <div className="flex gap-3">
+                    <button onClick={() => setShowSaveModal(true)} className="flex items-center gap-2 px-5 py-2.5 bg-[#1a1a1a] border border-[#00ff88]/20 text-[#00ff88] rounded-full font-black hover:bg-[#222] transition-colors"><Save size={14} /> 儲存版本</button>
+                    <button onClick={() => fileInputRef.current.click()} className="flex items-center gap-2 px-5 py-2.5 bg-[#111] border border-white/10 rounded-full font-black hover:border-[#00ff88]/50 transition-colors"><Upload size={14} /> 倒入 AI/SVG</button>
+                    <input type="file" ref={fileInputRef} className="hidden" accept=".svg" onChange={handleFileUpload} />
+                    <button onClick={exportToAI} className="flex items-center gap-2 px-6 py-2.5 bg-[#00ff88] text-black rounded-full font-black shadow-lg hover:brightness-110 active:scale-95 transition-all"><Download size={18} /> 生成 AI 拼模檔</button>
+                </div>
+            </header>
+
+            <main className="flex-1 flex overflow-hidden">
+                <aside className="w-64 border-r border-white/5 bg-[#0a0a0a] overflow-y-auto p-4 space-y-6 scrollbar-hide">
+                    <div className="bg-[#020202] p-1 rounded-xl border border-white/5 flex shadow-inner">
+                        <button onClick={() => setMode('manual')} className={`flex-1 py-2 text-[9px] rounded-lg transition font-black uppercase ${mode === 'manual' ? 'bg-[#1a1a1a] text-[#00ff88]' : 'text-slate-600'}`}>手動設定</button>
+                        <button onClick={() => setMode('import')} className={`flex-1 py-2 text-[9px] rounded-lg transition font-black uppercase ${mode === 'import' ? 'bg-[#1a1a1a] text-[#00ff88]' : 'text-slate-600'}`}>向量感應</button>
+                    </div>
+                    {mode === 'manual' && (
+                        <section className="space-y-4 animate-in slide-in-from-left-2">
+                            <label className="text-[10px] font-black text-[#00ff88] uppercase tracking-widest flex items-center gap-2 font-mono"><BoxSelect size={14} /> 1. 核心參數 (MM)</label>
+                            <div className="grid grid-cols-3 gap-1.5 font-mono text-center">
+                                {['l', 'w', 'h'].map(k => (
+                                    <div key={k} className="bg-[#050505] p-2 rounded-xl border border-white/5 shadow-inner text-white font-black">
+                                        <span className="text-[8px] text-slate-600 block mb-1 font-bold uppercase">{k}</span>
+                                        <input type="number" className="w-full bg-transparent outline-none text-xs text-center" value={struct[k]} onChange={e => setStruct({ ...struct, [k]: parseInt(e.target.value) || 0 })} />
+                                    </div>
+                                ))}
+                            </div>
+                        </section>
+                    )}
+                    <section className="space-y-4">
+                        <label className="text-[10px] font-black text-[#00ff88] uppercase tracking-widest flex items-center gap-2 font-mono"><Settings size={14} /> 2. 鏈式避讓與間距</label>
+                        <div className="bg-[#050505] p-4 rounded-2xl border border-white/5 space-y-4 shadow-xl">
+                            <div className="space-y-2">
+                                <div className="flex justify-between text-[9px] font-black uppercase tracking-tighter"><span className="text-slate-500 italic">安全刀間距</span><span className="text-white font-mono">{minGutter} MM</span></div>
+                                <input type="range" min="6" max="100" className="w-full accent-[#00ff88]" value={minGutter} onChange={e => setMinGutter(parseInt(e.target.value))} />
+                            </div>
+                            <div className="space-y-2 pt-2 border-t border-white/5">
+                                <div className="flex justify-between text-[9px] font-black uppercase tracking-tighter"><span className="text-slate-500 italic">左右雙向偏移</span><span className="text-[#00ff88] font-mono">{xShiftManual} MM</span></div>
+                                <input type="range" min="-200" max="200" className="w-full accent-[#00ff88]" value={xShiftManual} onChange={e => setXShiftManual(parseInt(e.target.value))} />
+                            </div>
+                        </div>
+                    </section>
+                    <section className="space-y-4 border-t border-white/10 pt-4">
+                        <label className="text-[10px] font-black text-slate-500 uppercase tracking-widest flex items-center gap-2 font-mono"><FileText size={14} /> 3. 印刷紙張設定</label>
+                        <select className="w-full bg-[#050505] border border-white/10 p-3 rounded-xl text-xs text-slate-200 outline-none font-black" value={paperId} onChange={e => setPaperId(e.target.value)}>
+                            {PAPER_SIZES.map(p => <option key={p.id} value={p.id}>{p.name} ({p.width}x{p.height})</option>)}
+                        </select>
+                        {paperId === 'CUSTOM' && (
+                            <div className="grid grid-cols-2 gap-2 animate-in slide-in-from-top-2">
+                                <div className="bg-[#050505] p-2 rounded-xl border border-white/5 text-center shadow-inner">
+                                    <span className="text-[7px] text-slate-600 block mb-1">寬 (W)</span>
+                                    <input type="number" className="w-full bg-transparent text-white font-mono text-xs font-black outline-none text-center" value={customPaper.w} onChange={e => setCustomPaper({ ...customPaper, w: parseInt(e.target.value) || 0 })} />
+                                </div>
+                                <div className="bg-[#050505] p-2 rounded-xl border border-white/5 text-center shadow-inner">
+                                    <span className="text-[7px] text-slate-600 block mb-1">高 (H)</span>
+                                    <input type="number" className="w-full bg-transparent text-white font-mono text-xs font-black outline-none text-center" value={customPaper.h} onChange={e => setCustomPaper({ ...customPaper, h: parseInt(e.target.value) || 0 })} />
+                                </div>
+                            </div>
+                        )}
+                    </section>
+                    <div className="flex items-center justify-between p-3 bg-[#111] rounded-xl border border-white/5 shadow-inner">
+                        <span className="text-[9px] font-black text-[#00ff88] uppercase italic tracking-widest">180° 自動對插</span>
+                        <div onClick={() => setIsInterlocking(!isInterlocking)} className={`w-10 h-5 rounded-full cursor-pointer transition-all p-1 flex items-center ${isInterlocking ? 'bg-[#00ff88]' : 'bg-slate-800'}`}>
+                            <div className={`w-3 h-3 bg-white rounded-full transition-transform ${isInterlocking ? 'translate-x-5' : 'translate-x-0'}`} />
+                        </div>
+                    </div>
+                    <div className="space-y-2 pt-2">
+                        <label className="text-[10px] font-black text-slate-500 uppercase tracking-widest flex items-center gap-2"><Maximize2 size={14} /> 畫板預覽縮放</label>
+                        <input type="range" min="0.05" max="2.0" step="0.01" className="w-full accent-[#00ff88]" value={zoom} onChange={e => setZoom(parseFloat(e.target.value))} />
+                    </div>
+                </aside>
+
+                <section className="flex-1 bg-[#000] relative overflow-auto p-4 flex items-start justify-center scrollbar-hide">
+                    <div className={`absolute inset-0 opacity-[0.03] pointer-events-none ${grainDirection === 'long' ? 'bg-[repeating-linear-gradient(0deg,transparent,transparent_2px,#fff_2px,#fff_3px)]' : 'bg-[repeating-linear-gradient(90deg,transparent,transparent_2px,#fff_2px,#fff_3px)]'}`} />
+                    <div className="bg-white shadow-[0_0_100px_rgba(0,0,0,1)] relative transition-all duration-700 border-[4px] border-[#0a0a0a] flex-shrink-0"
+                        style={{ width: currentPaper.width * zoom, height: currentPaper.height * zoom }}
+                    >
+                        <div className="absolute bottom-0 left-0 w-full bg-red-500/5 border-t border-red-500/20 flex items-center justify-center overflow-hidden" style={{ height: 10 * zoom }}>
+                            <span className="text-[6px] text-red-500 font-black opacity-30 font-mono tracking-widest uppercase">Gripper_10mm</span>
+                        </div>
+                        {/* 視覺居中對齊邏輯：防止切邊 */}
+                        <div className="absolute" style={{
+                            left: ((currentPaper.width - (activeSolution.cols * (activeSolution.itemW + minGutter) - minGutter + Math.abs(xShiftManual))) / 2) * zoom,
+                            top: ((currentPaper.height - ((activeSolution.rows - 1) * activeSolution.yStep + activeSolution.itemH)) / 2) * zoom
+                        }}>
+                            {Array.from({ length: activeSolution.total || 0 }).map((_, i) => {
+                                const row = Math.floor(i / activeSolution.cols);
+                                const col = i % activeSolution.cols;
+                                const isFlipped = isInterlocking && row % 2 === 1;
+                                return (
+                                    <div key={i} className="absolute transition-all duration-300"
+                                        style={{
+                                            left: (col * (activeSolution.itemW + minGutter) + (isFlipped ? xShiftManual : 0)) * zoom,
+                                            top: row * activeSolution.yStep * zoom,
+                                        }}
+                                    >
+                                        <BoxDieline params={struct} detailSettings={details} scale={zoom} isFlipped={isFlipped} isItemRotated={activeSolution.isRotated} importedSvg={mode === 'import' ? importedData : null} />
+                                    </div>
+                                );
+                            })}
+                        </div>
+                    </div>
+                </section>
+
+                <aside className="w-72 border-l border-white/5 bg-[#0a0a0a] p-5 flex flex-col space-y-6 overflow-y-auto scrollbar-hide">
+                    <div className="bg-gradient-to-br from-[#111] to-[#050505] p-5 rounded-[2.5rem] border border-white/10 shadow-2xl relative flex flex-col justify-center text-center">
+                        <div className="text-[10px] text-slate-500 font-black uppercase tracking-widest mb-2 flex items-center justify-center gap-2"><Target size={12} />最終產出模數</div>
+                        <div className="text-6xl font-black text-[#00ff88] italic leading-tight">{activeSolution.total} <span className="text-lg not-italic text-slate-600 font-bold uppercase tracking-tighter">UP</span></div>
+                        <div className="mt-2 text-[8px] bg-white/5 text-slate-400 py-1 rounded-full font-black uppercase border border-white/5 tracking-widest italic">利用率: {activeSolution.efficiency}%</div>
+                    </div>
+                    <div className="space-y-3">
+                        <label className="text-[10px] font-black text-slate-500 uppercase tracking-widest flex items-center gap-2 font-mono"><LayoutGrid size={14} className="text-[#00ff88]" /> 拼模方案選擇</label>
+                        <div className="grid grid-cols-1 gap-2">
+                            {solutions.map((sol, idx) => (
+                                <button key={sol.id} onClick={() => setSelectedSolutionIdx(idx)}
+                                    className={`p-3 rounded-2xl border transition-all text-left group ${selectedSolutionIdx === idx ? 'bg-[#00ff88]/10 border-[#00ff88] shadow-lg' : 'bg-[#050505] border-white/5 hover:border-white/10'}`}
+                                >
+                                    <div className="flex justify-between items-center mb-1">
+                                        <span className={`font-black text-[10px] ${selectedSolutionIdx === idx ? 'text-[#00ff88]' : 'text-slate-400'}`}>{sol.name}</span>
+                                        <Check size={12} className={selectedSolutionIdx === idx ? 'text-[#00ff88]' : 'text-transparent'} />
+                                    </div>
+                                    <div className="flex justify-between items-end">
+                                        <div className="text-[14px] font-black text-white leading-none">{sol.total} <span className="text-[8px] text-slate-600">UP</span></div>
+                                        <div className="text-[8px] font-mono text-slate-600 group-hover:text-[#00ff88]/50 italic text-right">利用率: {sol.efficiency}%</div>
+                                    </div>
+                                </button>
+                            ))}
+                        </div>
+                    </div>
+                    <div className="bg-[#050505] p-4 rounded-3xl border border-white/5 space-y-2 shadow-inner text-[10px] font-bold">
+                        <div className="text-slate-600 font-black uppercase tracking-widest border-b border-white/5 pb-2 mb-2 flex items-center gap-2 font-mono"><Ruler size={12} />理想紙張大小 (100%)</div>
+                        <div className="flex justify-between uppercase"><span className="text-slate-500 italic tracking-tighter">建議寬度</span><span className="text-[#00ff88] font-mono">{activeSolution.idealW} MM</span></div>
+                        <div className="flex justify-between uppercase"><span className="text-slate-500 italic tracking-tighter">建議高度</span><span className="text-[#00ff88] font-mono">{activeSolution.idealH} MM</span></div>
+                    </div>
+                    <div className="flex-1 space-y-4 pt-4 border-t border-white/5 overflow-hidden flex flex-col">
+                        <label className="text-[10px] font-black text-slate-500 uppercase tracking-widest flex items-center gap-2 font-mono"><History size={14} className="text-[#00ff88]" /> 歷史存檔紀錄</label>
+                        <div className="flex-1 overflow-y-auto space-y-2 pr-1 scrollbar-hide">
+                            {versions.map(v => (
+                                <div key={v.id} onClick={() => loadVersion(v)} className="group bg-[#050505] p-2.5 rounded-xl border border-white/5 hover:border-[#00ff88]/30 cursor-pointer transition-all relative">
+                                    <div className="flex justify-between items-center mb-1">
+                                        <span className="text-[9px] font-black text-white group-hover:text-[#00ff88] truncate pr-4">{v.name}</span>
+                                        <button onClick={(e) => { e.stopPropagation(); deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'imposition_versions', v.id)); }} className="text-slate-700 hover:text-red-500 transition-colors"><Trash2 size={10} /></button>
+                                    </div>
+                                    <div className="flex justify-between text-[7px] text-slate-600 font-mono italic uppercase"><span>{v.paperId}</span><span>{v.totalYield} UP</span></div>
+                                </div>
+                            ))}
+                        </div>
+                    </div>
+                </aside>
+            </main>
+
+            {showSaveModal && (
+                <div className="fixed inset-0 z-[100] bg-black/80 flex items-center justify-center p-4 backdrop-blur-sm animate-in fade-in duration-300">
+                    <div className="bg-[#111] border border-[#00ff88]/30 w-full max-w-sm rounded-[2rem] p-6 shadow-2xl animate-in zoom-in-95">
+                        <h3 className="text-lg font-black text-white italic mb-4 uppercase tracking-tight">儲存拼模工程版本</h3>
+                        <input autoFocus type="text" className="w-full bg-[#050505] border border-white/10 rounded-xl p-4 text-white font-black text-sm outline-none focus:border-[#00ff88]/50 mb-6 transition-all"
+                            placeholder="命名此排版版本..." value={saveName} onChange={e => setSaveName(e.target.value)} />
+                        <div className="flex gap-2">
+                            <button onClick={() => setShowSaveModal(false)} className="flex-1 py-4 text-xs font-black text-slate-500 bg-[#1a1a1a] rounded-xl hover:bg-[#222] transition-colors">取消</button>
+                            <button onClick={saveCurrentVersion} disabled={!saveName || isSaving} className="flex-1 py-4 text-xs font-black text-black bg-[#00ff88] rounded-xl hover:brightness-110 flex items-center justify-center gap-2 shadow-lg shadow-[#00ff88]/10 disabled:opacity-50 transition-colors">
+                                {isSaving ? <RotateCw className="animate-spin" size={14} /> : <Check size={14} />} 確認儲存
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
+            <footer className="bg-[#020202] border-t border-white/5 px-6 py-2 flex justify-between items-center text-[8px] text-slate-700 font-black uppercase tracking-[0.4em]">
+                <div className="flex gap-8">
+                    <span className="flex items-center gap-2"><div className="w-1.5 h-1.5 rounded-full bg-[#00ff88] animate-pulse"></div> ENGINE v8.17-FINAL</span>
+                    <span>DIE_LINE_DEPTH: FINE_0.5PT</span>
+                </div>
+                <div className="font-mono italic text-white/30 tracking-tighter">Verified Engineering Workflow for Professional Printing</div>
+            </footer>
+        </div>
+    );
+};
+
+export default App;
