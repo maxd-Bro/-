@@ -161,11 +161,20 @@ const App = () => {
     const handleFileUpload = (e) => {
         const file = e.target.files[0];
         if (!file) return;
+
+        const isAI = file.name.toLowerCase().endsWith('.ai');
+
         const reader = new FileReader();
         reader.onload = (ev) => {
             const parser = new DOMParser();
-            const svgElement = parser.parseFromString(ev.target.result, "image/svg+xml").querySelector("svg");
-            if (svgElement) {
+
+            // 嘗試解析 (AI 檔若為 PDF 相容格式，可能包含 XMP 或 SVG stream，但瀏覽器原生支援有限)
+            // 這裡假設使用者匯入的是 "帶有 SVG 內容" 的檔案 (例如被改副檔名的 SVG)
+            const svgDoc = parser.parseFromString(ev.target.result, "image/svg+xml");
+            const svgElement = svgDoc.querySelector("svg");
+            const parserError = svgDoc.querySelector("parsererror");
+
+            if (svgElement && !parserError) {
                 const viewBox = svgElement.getAttribute("viewBox") || "0 0 500 500";
                 const parts = viewBox.split(/[\s,]+/).map(Number);
                 const ratio = (parts[2] || 500) > 1200 ? (25.4 / 72) : 1;
@@ -174,6 +183,12 @@ const App = () => {
                     viewBox, rawContent: svgElement.innerHTML
                 });
                 setMode('import');
+            } else {
+                if (isAI) {
+                    alert("無法讀取此 AI 檔。\n瀏覽器僅支援「文字型 SVG」或「偽裝成 AI 的 SVG 檔」。\n\n建議：請在 Illustrator 中將檔案「另存為 SVG」後再匯入。");
+                } else {
+                    alert("無法解析此 SVG 檔案，格式可能不正確。");
+                }
             }
         };
         reader.readAsText(file);
@@ -367,7 +382,7 @@ const App = () => {
                 <div className="flex gap-3">
                     <button onClick={() => setShowSaveModal(true)} className="flex items-center gap-2 px-5 py-2.5 bg-[#1a1a1a] border border-[#00ff88]/20 text-[#00ff88] rounded-full font-black hover:bg-[#222] transition-colors"><Save size={14} /> 儲存版本</button>
                     <button onClick={() => fileInputRef.current.click()} className="flex items-center gap-2 px-5 py-2.5 bg-[#111] border border-white/10 rounded-full font-black hover:border-[#00ff88]/50 transition-colors"><Upload size={14} /> 倒入 AI/SVG</button>
-                    <input type="file" ref={fileInputRef} className="hidden" accept=".svg" onChange={handleFileUpload} />
+                    <input type="file" ref={fileInputRef} className="hidden" accept=".svg,.ai" onChange={handleFileUpload} />
                     <button onClick={exportToAI} className="flex items-center gap-2 px-6 py-2.5 bg-[#00ff88] text-black rounded-full font-black shadow-lg hover:brightness-110 active:scale-95 transition-all"><Download size={18} /> 生成 AI 拼模檔</button>
                 </div>
             </header>
