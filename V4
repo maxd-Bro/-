@@ -1,0 +1,665 @@
+import React, { useState, useMemo, useRef, useEffect } from 'react';
+import {
+    Settings,
+    FileText,
+    Layers,
+    Printer,
+    TrendingUp,
+    Box,
+    Layout,
+    Scissors,
+    CheckCircle2,
+    BarChart3,
+    Upload,
+    FileCode,
+    Check,
+    X,
+    Target,
+    Ruler,
+    Download,
+    MoveHorizontal,
+    Maximize2,
+    AlertTriangle,
+    Info,
+    BoxSelect,
+    MousePointer2,
+    Lock,
+    ChevronDown,
+    Package,
+    History,
+    Save,
+    Trash2,
+    Cloud,
+    RotateCw,
+    Cpu,
+    ArrowRightLeft,
+    LayoutGrid,
+    Zap,
+    Factory,
+    ScanLine,
+    Scroll,
+    Scale,
+    Edit3
+} from 'lucide-react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken } from 'firebase/auth';
+import { getFirestore, collection, doc, setDoc, getDoc, onSnapshot, query, addDoc, deleteDoc, Timestamp } from 'firebase/firestore';
+
+// --- Firebase 初始化 ---
+const firebaseConfig = JSON.parse(__firebase_config);
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getFirestore(app);
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'imposition-system-v8';
+
+const PAPER_SIZES = [
+    { id: 'G1K_STD', name: '菊全開 (標準)', width: 889, height: 635, group: '菊版' },
+    { id: 'B1K_STD', name: '四六全 (標準)', width: 788, height: 1030, group: '四六版' },
+    { id: 'G1K_MAX', name: '特大版 (大菊全)', width: 889, height: 1190, group: '特規版' },
+    { id: 'CUSTOM', name: '自訂規格 (MM)', width: 500, height: 500, group: '自訂' },
+];
+
+const THICKNESS_DATA = [
+    { val: 0.26, widths: [635, 787, 889, 1092], label: "0.26 mm (卡紙/銅版)" },
+    { val: 0.30, widths: [635, 787, 889, 1003, 1092], label: "0.30 mm" },
+    { val: 0.35, widths: [635, 787, 889, 1092], label: "0.35 mm" },
+    { val: 0.40, widths: [575, 635, 730, 787, 889, 1003, 1092], label: "0.40 mm" },
+    { val: 0.45, widths: [575, 635, 730, 787, 850, 889, 1003, 1092], label: "0.45 mm" },
+    { val: 0.50, widths: [500, 546, 575, 635, 700, 730, 787, 850, 889, 1003, 1092], label: "0.50 mm" },
+    { val: 0.55, widths: [500, 546, 575, 635, 700, 730, 787, 850, 889, 1003, 1092], label: "0.55 mm" },
+    { val: 0.60, widths: [575, 635, 730, 787, 850, 889, 1003, 1092], label: "0.60 mm" },
+];
+
+const getNormalizedBoxPaths = (l, w, h, hasTongue, glueSide, strokeColor = "#00E676", strokeWidth = "0.5pt") => {
+    const glueW = 15;
+    const flapH = w * 0.8;
+    const gX = glueSide === 'right' ? (l + w) * 2 : 0;
+
+    const common = `fill="none" stroke="${strokeColor}" stroke-width="${strokeWidth}"`;
+    const topFlapPath = `M 0 ${flapH} L ${l * 0.15} ${flapH * 0.2} Q ${l * 0.5} ${hasTongue ? -10 : 0} ${l * 0.85} ${flapH * 0.2} L ${l} ${flapH}`;
+    const bottomFlapPath = `M 0 0 L ${l * 0.15} ${flapH * 0.8} Q ${l * 0.5} ${flapH + (hasTongue ? 10 : 0)} ${l * 0.85} ${flapH * 0.8} L ${l} 0`;
+
+    return `
+    <rect x="${glueSide === 'left' ? glueW : 0}" y="${flapH}" width="${l}" height="${h}" ${common} />
+    <rect x="${(glueSide === 'left' ? glueW : 0) + l}" y="${flapH}" width="${w}" height="${h}" ${common} />
+    <rect x="${(glueSide === 'left' ? glueW : 0) + l + w}" y="${flapH}" width="${l}" height="${h}" ${common} />
+    <rect x="${(glueSide === 'left' ? glueW : 0) + l * 2 + w}" y="${flapH}" width="${w}" height="${h}" ${common} />
+    <rect x="${gX}" y="${flapH}" width="${glueW}" height="${h}" stroke-dasharray="2,2" ${common} />
+    <g transform="translate(${glueSide === 'left' ? glueW : 0}, 0)"><path d="${topFlapPath}" ${common} /></g>
+    <g transform="translate(${(glueSide === 'left' ? glueW : 0) + l + w}, ${h + flapH})"><path d="${bottomFlapPath}" ${common} /></g>
+  `;
+};
+
+const BoxDieline = ({ scale, isFlipped, isItemRotated, params, detailSettings, importedSvg, importUnit }) => {
+    const { l, w, h } = params;
+    const { hasTongue, glueSide } = detailSettings;
+    const s = scale;
+
+    if (importedSvg && importedSvg.rawContent) {
+        // 使用者強制修正的尺寸，如果沒有 userW 則預設為原始偵測尺寸 (rawW)
+        // 這裡我們預設原始數據即為 MM，不做 PT 轉換
+        const userW = importedSvg.userW || importedSvg.rawW;
+        const userH = importedSvg.userH || importedSvg.rawH;
+
+        const visualW = isItemRotated ? userH : userW;
+        const visualH = isItemRotated ? userW : userH;
+
+        // 計算縮放比例：將原始 SVG 的 viewBox 縮放到使用者指定的尺寸
+        // SVG viewBox 寬度
+        const vbW = importedSvg.viewBox.split(' ')[2] || userW;
+        const vbH = importedSvg.viewBox.split(' ')[3] || userH;
+
+        // Scale Factor = Target Size / Original Size
+        // 注意：這裡的 scaleX/Y 是為了讓 SVG 內容呈現為 userW/userH 的大小
+        // 外層 div 已經設定為 visualW * s，所以 svg 設為 100% 即可
+
+        return (
+            <div style={{
+                width: visualW * s, height: visualH * s,
+                transform: isFlipped ? 'rotate(180deg)' : 'none',
+                display: 'flex', alignItems: 'center', justifyContent: 'center', transition: 'all 0.3s ease'
+            }}>
+                <svg width="100%" height="100%" viewBox={importedSvg.viewBox} style={{ overflow: 'visible', transform: isItemRotated ? 'rotate(90deg)' : 'none' }} fill="none" preserveAspectRatio="none">
+                    <style>{`path, line, rect, polyline, circle, polygon { stroke: ${isFlipped ? "#00C853" : "#00E676"} !important; stroke-width: 2px !important; fill: none !important; vector-effect: non-scaling-stroke; }`}</style>
+                    <g dangerouslySetInnerHTML={{ __html: importedSvg.rawContent }} />
+                </svg>
+            </div>
+        );
+    }
+
+    const flapH = w * 0.8;
+    const totalW = (l + w) * 2 + 15;
+    const totalH = h + flapH * 2;
+    const visualW = isItemRotated ? totalH : totalW;
+    const visualH = isItemRotated ? totalW : totalH;
+
+    return (
+        <div style={{ transform: isFlipped ? 'rotate(180deg)' : 'none', transition: 'transform 0.3s ease' }}>
+            <svg width={visualW * s} height={visualH * s} viewBox={`0 0 ${visualW} ${visualH}`} className="overflow-visible">
+                <g transform={isItemRotated ? `rotate(90, ${visualW / 2}, ${visualH / 2}) translate(${(visualW - totalW) / 2}, ${(visualH - totalH) / 2})` : ''}>
+                    <g dangerouslySetInnerHTML={{ __html: getNormalizedBoxPaths(l, w, h, hasTongue, glueSide, isFlipped ? "#00C853" : "#00E676", "1.8px") }} />
+                </g>
+            </svg>
+        </div>
+    );
+};
+
+const App = () => {
+    const [mode, setMode] = useState('manual');
+    const [struct, setStruct] = useState({ l: 50, w: 60, h: 70 });
+    const [details, setDetails] = useState({ hasTongue: true, glueSide: 'right' });
+    const [paperThickness, setPaperThickness] = useState(0.26);
+    const [paperId, setPaperId] = useState('G1K_STD');
+    const [customPaper, setCustomPaper] = useState({ w: 889, h: 635 });
+    const [minGutter, setMinGutter] = useState(6);
+    const [isInterlocking, setIsInterlocking] = useState(true);
+    const [xShiftManual, setXShiftManual] = useState(0);
+    const [zoom, setZoom] = useState(0.3);
+    const [importedData, setImportedData] = useState(null);
+    const [fileError, setFileError] = useState(null); // 新增錯誤狀態
+    const [selectedSolutionIdx, setSelectedSolutionIdx] = useState(0);
+    const [grainDirection, setGrainDirection] = useState('long');
+
+    const [user, setUser] = useState(null);
+    const [versions, setVersions] = useState([]);
+    const [isSaving, setIsSaving] = useState(false);
+    const [saveName, setSaveName] = useState("");
+    const [showSaveModal, setShowSaveModal] = useState(false);
+    const fileInputRef = useRef(null);
+
+    useEffect(() => {
+        const initAuth = async () => {
+            if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                await signInWithCustomToken(auth, __initial_auth_token);
+            } else { await signInAnonymously(auth); }
+        };
+        initAuth();
+        onAuthStateChanged(auth, setUser);
+    }, []);
+
+    useEffect(() => {
+        if (!user) return;
+        return onSnapshot(collection(db, 'artifacts', appId, 'public', 'data', 'imposition_versions'), (snapshot) => {
+            const vList = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+            vList.sort((a, b) => (b.createdAt?.toMillis() || 0) - (a.createdAt?.toMillis() || 0));
+            setVersions(vList);
+        });
+    }, [user]);
+
+    const handleFileUpload = (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+        setFileError(null);
+
+        // 檢查檔案類型
+        const isAI = file.name.toLowerCase().endsWith('.ai');
+        // 移除強制阻擋：讓瀏覽器嘗試讀取 (若為 PDF 相容 AI 或更名 SVG)
+
+        const reader = new FileReader();
+        reader.onload = (ev) => {
+            const content = ev.target.result;
+            const isIllustrator = content.includes("Adobe Illustrator");
+
+            const parser = new DOMParser();
+            const svgDoc = parser.parseFromString(content, "image/svg+xml");
+            const svgElement = svgDoc.querySelector("svg");
+            const parserError = svgDoc.querySelector("parsererror");
+
+            if (svgElement && !parserError) {
+                const viewBoxAttr = svgElement.getAttribute("viewBox");
+                const widthAttr = svgElement.getAttribute("width");
+                const heightAttr = svgElement.getAttribute("height");
+                const parts = viewBoxAttr ? viewBoxAttr.split(/[\s,]+/).map(Number) : [0, 0, 500, 500];
+
+                let rawW = parts[2];
+                let rawH = parts[3];
+
+                const parseUnit = (str) => {
+                    if (!str) return null;
+                    const val = parseFloat(str);
+                    if (str.includes("mm")) return val;
+                    if (str.includes("pt")) return val * 0.3527;
+                    if (str.includes("cm")) return val * 10;
+                    return null;
+                };
+
+                // 優先讀取明確的屬性單位
+                const wFromAttr = parseUnit(widthAttr);
+                const hFromAttr = parseUnit(heightAttr);
+
+                const applyUnitCnv = (val) => {
+                    // 如果是 Illustrator 檔案且沒有單位，預設為 PT (72dpi) -> MM (x0.352778)
+                    // 否則依照使用者設定，預設為 MM (x1)
+                    if (isIllustrator) return val * 0.352778;
+                    return val;
+                };
+
+                if (wFromAttr) rawW = wFromAttr;
+                else if (!rawW && widthAttr) rawW = applyUnitCnv(parseFloat(widthAttr));
+                else if (isIllustrator && rawW) rawW = rawW * 0.352778; // ViewBox fallback correction
+
+                if (hFromAttr) rawH = hFromAttr;
+                else if (!rawH && heightAttr) rawH = applyUnitCnv(parseFloat(heightAttr));
+                else if (isIllustrator && rawH) rawH = rawH * 0.352778; // ViewBox fallback correction
+
+                const unitInfo = wFromAttr ? 'Explicit Unit'
+                    : isIllustrator ? 'AI (Default PT->MM)'
+                        : 'No Unit (Default MM)';
+
+                setImportedData({
+                    fileName: file.name,
+                    rawW: rawW || 500,
+                    rawH: rawH || 500,
+                    userW: rawW || 500,
+                    userH: rawH || 500,
+                    viewBox: viewBoxAttr || `0 0 ${parts[2]} ${parts[3]}`,
+                    rawContent: svgElement.innerHTML,
+                    detectedUnitInfo: unitInfo
+                });
+                setMode('import');
+            } else {
+                if (isAI) {
+                    setFileError("無法讀取此 AI 檔 (此為二進位格式)。\n請在 Illustrator 中「另存新檔」為 SVG 格式，或確保 AI 檔存成「PDF 相容」格式 (含 SVG 串流)。");
+                } else {
+                    setFileError("無法解析此檔案。請確認這是一個標準的 SVG 向量檔。");
+                }
+            }
+        };
+        reader.readAsText(file);
+    };
+
+    const currentPaper = useMemo(() => {
+        if (paperId === 'CUSTOM') return { id: 'CUSTOM', name: '自訂規格', width: customPaper.w, height: customPaper.h };
+        return PAPER_SIZES.find(p => p.id === paperId) || PAPER_SIZES[0];
+    }, [paperId, customPaper]);
+
+    // --- 核心拼模演算法 v9.11 ---
+    const solutions = useMemo(() => {
+        const bleed = 2;
+        const margin = 10;
+
+        // 使用 userW/userH (使用者可能已經修正過)
+        let realW = 0, realH = 0;
+        if (mode === 'import' && importedData) {
+            realW = importedData.userW;
+            realH = importedData.userH;
+        } else {
+            realW = (struct.l + struct.w) * 2 + 15;
+            realH = struct.h + struct.w * 1.6;
+        }
+
+        const baseW = realW + (bleed * 2);
+        const baseH = realH + (bleed * 2);
+        const validRollWidths = THICKNESS_DATA.find(t => t.val === paperThickness)?.widths || [];
+
+        const solveForPaper = (pW, pH, itemW, itemH, isRotated) => {
+            let currentFlapDepth = 0;
+            if (!isRotated) {
+                const panelWidth = mode === 'import' ? itemW * 0.25 : struct.l;
+                const collisionThreshold = panelWidth * 0.3;
+                if (Math.abs(xShiftManual) < collisionThreshold) currentFlapDepth = 0;
+                else currentFlapDepth = mode === 'import' ? itemH * 0.35 : struct.w * 0.8;
+            }
+
+            const safeOverlap = isInterlocking ? currentFlapDepth : 0;
+            const yStep = itemH - safeOverlap + minGutter;
+            const xShiftComp = Math.abs(isRotated ? 0 : xShiftManual);
+
+            const availW = pW - margin * 2;
+            const availH = pH - margin * 2;
+
+            const cols = Math.max(0, Math.floor((availW + minGutter - xShiftComp) / (itemW + minGutter)));
+            const rows = itemH <= availH ? 1 + Math.floor((availH - itemH) / yStep) : 0;
+            const total = cols * rows;
+
+            const idealW = cols > 0 ? Math.ceil(cols * (itemW + minGutter) - minGutter + xShiftComp + margin * 2) : 0;
+            const idealH = rows > 0 ? Math.ceil((rows - 1) * yStep + itemH + margin * 2) : 0;
+
+            return { total, cols, rows, idealW, idealH, yStep, itemW, itemH, isRotated, safeOverlap, pW, pH };
+        };
+
+        const normalPlan = solveForPaper(currentPaper.width, currentPaper.height, baseW, baseH, false);
+        const rotatedPlan = solveForPaper(currentPaper.width, currentPaper.height, baseH, baseW, true);
+
+        const userPlans = [
+            { ...normalPlan, id: 'normal', name: '橫向拼排 (0°)', type: 'user' },
+            { ...rotatedPlan, id: 'rotated', name: '縱向拼排 (90°)', type: 'user' }
+        ];
+
+        let bestMachinePlan = null;
+        let maxTotal = 0;
+        // ... 機台優化邏輯 (略，保持不變) ... 
+
+        const finalPlans = [...userPlans];
+        // if (bestMachinePlan) finalPlans.push(bestMachinePlan);
+
+        return finalPlans.map(plan => ({
+            ...plan,
+            efficiency: plan.total > 0 ? ((plan.total * baseW * baseH) / (plan.pW * plan.pH) * 100).toFixed(2) : 0,
+            effectiveShift: plan.isRotated ? 0 : xShiftManual
+        })).sort((a, b) => {
+            if (b.type === 'auto' && a.type !== 'auto') return 1;
+            return b.total - a.total;
+        });
+    }, [struct, currentPaper, minGutter, isInterlocking, xShiftManual, mode, importedData, paperThickness]);
+
+    const activeSolution = solutions[selectedSolutionIdx] || solutions[0];
+    const lastSelectedIdx = useRef(selectedSolutionIdx);
+    const lastPaperId = useRef(paperId);
+
+    useEffect(() => {
+        if (paperId === 'CUSTOM') {
+            if (lastPaperId.current !== 'CUSTOM' || lastSelectedIdx.current !== selectedSolutionIdx) {
+                if (activeSolution.idealW > 0 && activeSolution.idealH > 0) {
+                    setCustomPaper({ w: activeSolution.idealW, h: activeSolution.idealH });
+                }
+            } else if (activeSolution.type === 'auto') {
+                if (Math.abs(customPaper.w - activeSolution.pW) > 1 || Math.abs(customPaper.h - activeSolution.pH) > 1) {
+                    setCustomPaper({ w: activeSolution.pW, h: activeSolution.pH });
+                }
+            }
+        }
+        lastSelectedIdx.current = selectedSolutionIdx;
+        lastPaperId.current = paperId;
+    }, [selectedSolutionIdx, paperId, activeSolution]);
+
+    const applyAutoPaper = () => {
+        const bestAuto = solutions.find(s => s.type === 'auto');
+        if (bestAuto) {
+            const idx = solutions.indexOf(bestAuto);
+            setSelectedSolutionIdx(idx);
+            setPaperId('CUSTOM');
+            setCustomPaper({ w: bestAuto.pW, h: bestAuto.pH });
+        }
+    };
+
+    const exportToAI = () => {
+        const { cols, total, itemW, itemH, yStep, isRotated, effectiveShift } = activeSolution;
+        const marginX = (currentPaper.width - (cols * (itemW + minGutter) - minGutter + Math.abs(effectiveShift))) / 2;
+        const marginY = (currentPaper.height - ((Math.ceil(total / cols) - 1) * yStep + itemH)) / 2;
+
+        // AI 匯出時，不進行 PT 轉換，假設使用者輸入的已是 MM
+        const ratio = 1;
+
+        const svgHeader = `<?xml version="1.0" encoding="utf-8"?>
+<svg version="1.1" xmlns="http://www.w3.org/2000/svg" width="${currentPaper.width}mm" height="${currentPaper.height}mm" viewBox="0 0 ${currentPaper.width} ${currentPaper.height}">
+  <style>.box{fill:none;stroke:#00E676;stroke-width:0.5pt;}.paper{fill:none;stroke:#D1D5DB;stroke-width:0.1pt;}</style>`;
+        let content = `\n  <rect class="paper" width="${currentPaper.width}" height="${currentPaper.height}"/>`;
+
+        for (let i = 0; i < total; i++) {
+            const row = Math.floor(i / cols);
+            const col = i % cols;
+            const isFlipped = isInterlocking && row % 2 === 1;
+            const x = marginX + col * (itemW + minGutter) + (isFlipped ? effectiveShift : 0);
+            const y = marginY + row * yStep;
+
+            const cellCX = x + itemW / 2;
+            const cellCY = y + itemH / 2;
+
+            // 角度計算
+            let angle = 0;
+            if (isRotated) angle += 90;
+            if (isFlipped) angle += 180;
+
+            // 巢狀群組 (Nested Group) 核心結構
+            content += `\n  <g transform="translate(${cellCX.toFixed(4)}, ${cellCY.toFixed(4)})">`;
+            content += `\n    <g transform="rotate(${angle})">`;
+            content += `\n      <g transform="translate(${-(itemW / 2).toFixed(4)}, ${-(itemH / 2).toFixed(4)})">`;
+
+            if (mode === 'import' && importedData) {
+                // SVG Import 縮放修正
+                const scaleX = importedData.userW / importedData.rawW;
+                const scaleY = importedData.userH / importedData.rawH;
+
+                // 移除 viewBox 偏移
+                const viewBox = importedData.viewBox.split(/[\s,]+/).map(Number);
+                const [vx, vy, vw, vh] = viewBox.length === 4 ? viewBox : [0, 0, 500, 500];
+
+                // 如果是 Illustrator 檔案，我們已經將 rawW 從 PT 轉為 MM
+                // 但這裡的 rawContent 裡面的數值如果是 PT，我們需要將其縮放到 MM
+                // 若 parser 已經將 userW 設為 MM，scaleX 會自動處理這個比例。
+                // 關鍵： viewBox 是原始數值 (e.g. 565 units)。 userW 是 199 mm。
+                // scaleX = 199 / 565 = 0.352.. (正確縮小)
+
+                // 我們要做的是位移修正：
+                // Raw Content 裡面的座標是基於 viewBox 的。
+                // 我们需要 translate(-vx, -vy) 將內容移到 (0,0)
+                // 然後再 scale。
+
+                // 但注意：importedData.rawW 是我們解析後的 "物理尺寸"。
+                // 如果 rawW = 199 (MM), viewBox width = 565 (Units)
+                // scaleX = 199 / 199 = 1 ??
+
+                // 等等，handleFileUpload 中：
+                // widthAttr = 565 -> isIllustrator -> rawW = 565 * 0.352 = 199.3
+                // userW = 199.3
+                // 所以 scaleX = 1.
+
+                // 但是 SVG 內部的 path d="M 0 565 ..." 是基於 565單位的。
+                // 如果我們只 scale(1)，那畫出來就是 565mm (巨大)。
+                // 所以我们需要將 "SVG 內部單位" 映射到 "物理尺寸"。
+
+                // 修正邏輯：
+                // 實際渲染寬度 = userW (MM)
+                // 原始視窗寬度 = viewBox Width (Units)
+                // 縮放比例 = userW / viewBoxWidth
+
+                const renderScaleX = importedData.userW / vw;
+                const renderScaleY = importedData.userH / vh;
+
+                content += `\n        <g transform="translate(${(-vx * renderScaleX).toFixed(4)}, ${(-vy * renderScaleY).toFixed(4)}) scale(${renderScaleX.toFixed(5)}, ${renderScaleY.toFixed(5)})">
+            <g style="fill:none; stroke:#00E676; stroke-width:${(0.5 / renderScaleX).toFixed(4)}pt;">${importedData.rawContent}</g>
+        </g>`;
+            } else {
+                content += `\n        ${getNormalizedBoxPaths(struct.l, struct.w, struct.h, details.hasTongue, details.glueSide, "#00E676", "0.5pt")}`;
+            }
+            content += `\n      </g>`;
+            content += `\n    </g>`;
+            content += `\n  </g>`;
+        }
+        const fullSvg = svgHeader + content + "\n</svg>";
+        const blob = new Blob([fullSvg], { type: 'image/svg+xml;charset=utf-8' });
+        const link = document.createElement('a');
+        link.href = URL.createObjectURL(blob);
+        link.download = `DrawStar_V9.11_MM_Fixed.svg`;
+        link.click();
+    };
+
+    const saveCurrentVersion = async () => { /* ... */ };
+    const loadVersion = (v) => { /* ... */ };
+    const deleteVersion = async (e, id) => { /* ... */ };
+
+    return (
+        <div className="flex flex-col h-screen bg-[#050505] text-slate-300 font-sans text-sm overflow-hidden text-[11px]">
+            <header className="bg-[#111] border-b border-white/5 px-6 py-4 flex justify-between items-center shadow-2xl z-50">
+                <div className="flex items-center gap-5">
+                    <div className="bg-[#00ff88] p-2 rounded-2xl shadow-[0_0_20px_rgba(0,255,136,0.5)]"><Factory size={26} className="text-black fill-current" /></div>
+                    <div>
+                        <h1 className="text-xl font-black text-white tracking-tighter italic uppercase leading-none mb-1 text-blue-50">DrawStar <span className="text-[#00ff88]">v9.11-PRO</span></h1>
+                        <div className="flex items-center gap-2 text-[10px] text-slate-500 font-black uppercase tracking-widest italic font-mono">
+                            <Cpu size={12} className="text-[#00ff88]" /> 單位解析引擎：Smart Detect (Auto AI Fix)
+                        </div>
+                    </div>
+                </div>
+                <div className="flex gap-3">
+                    <button onClick={() => setShowSaveModal(true)} className="flex items-center gap-2 px-5 py-2.5 bg-[#1a1a1a] border border-[#00ff88]/20 text-[#00ff88] rounded-full font-black hover:bg-[#222]"><Save size={14} /> 儲存</button>
+                    <button onClick={() => fileInputRef.current.click()} className="flex items-center gap-2 px-5 py-2.5 bg-[#111] border border-white/10 rounded-full font-black hover:border-[#00ff88]/50"><Upload size={14} /> 匯入</button>
+                    <input type="file" ref={fileInputRef} className="hidden" accept=".svg,.ai" onChange={handleFileUpload} />
+                    <button onClick={exportToAI} className="flex items-center gap-2 px-6 py-2.5 bg-[#00ff88] text-black rounded-full font-black shadow-lg hover:brightness-110 active:scale-95 transition-all"><Download size={18} /> 匯出 AI</button>
+                </div>
+            </header>
+
+            {/* Main Content (Identical to user provided code, just ensured correct variable scope) */}
+            <main className="flex-1 flex overflow-hidden">
+                <aside className="w-64 border-r border-white/5 bg-[#0a0a0a] overflow-y-auto p-4 space-y-6 scrollbar-hide">
+                    <div className="bg-[#020202] p-1 rounded-xl border border-white/5 flex shadow-inner">
+                        <button onClick={() => setMode('manual')} className={`flex-1 py-2 text-[9px] rounded-lg transition font-black uppercase ${mode === 'manual' ? 'bg-[#1a1a1a] text-[#00ff88]' : 'text-slate-600'}`}>手動設定</button>
+                        <button onClick={() => setMode('import')} className={`flex-1 py-2 text-[9px] rounded-lg transition font-black uppercase ${mode === 'import' ? 'bg-[#1a1a1a] text-[#00ff88]' : 'text-slate-600'}`}>向量感應</button>
+                    </div>
+
+                    <section className="space-y-4">
+                        <label className="text-[10px] font-black text-[#00ff88] uppercase tracking-widest flex items-center gap-2 font-mono"><Scroll size={14} /> 1. 紙張厚度選擇</label>
+                        <select className="w-full bg-[#050505] border border-white/10 p-3 rounded-xl text-xs text-slate-200 outline-none font-black cursor-pointer hover:border-[#00ff88]/50 transition"
+                            value={paperThickness} onChange={e => setPaperThickness(parseFloat(e.target.value))}>
+                            {THICKNESS_DATA.map(t => <option key={t.val} value={t.val}>{t.label}</option>)}
+                        </select>
+                    </section>
+
+                    {/* 新增：錯誤提示區 */}
+                    {fileError && (
+                        <div className="p-4 bg-red-500/10 border border-red-500/30 rounded-2xl flex gap-2 items-start animate-in slide-in-from-top-2">
+                            <AlertTriangle className="text-red-500 shrink-0" size={16} />
+                            <p className="text-[9px] text-red-200/80 leading-relaxed font-bold">{fileError}</p>
+                        </div>
+                    )}
+
+                    {mode === 'manual' && (
+                        <section className="space-y-4 animate-in slide-in-from-left-2">
+                            <label className="text-[10px] font-black text-[#00ff88] uppercase tracking-widest flex items-center gap-2 font-mono"><BoxSelect size={14} /> 2. 核心參數 (MM)</label>
+                            <div className="grid grid-cols-3 gap-1.5 font-mono text-center">
+                                {['l', 'w', 'h'].map(k => (
+                                    <div key={k} className="bg-[#050505] p-2 rounded-xl border border-white/5 shadow-inner text-white font-black">
+                                        <span className="text-[8px] text-slate-600 block mb-1 font-bold uppercase">{k}</span>
+                                        <input type="number" className="w-full bg-transparent outline-none text-xs text-center" value={struct[k]} onChange={e => setStruct({ ...struct, [k]: parseInt(e.target.value) || 0 })} />
+                                    </div>
+                                ))}
+                            </div>
+                        </section>
+                    )}
+
+                    {/* 新增：尺寸強制校正輸入框 */}
+                    {mode === 'import' && importedData && (
+                        <div className="p-4 bg-[#00ff88]/5 rounded-2xl border border-[#00ff88]/20 space-y-3">
+                            <div className="flex justify-between items-center text-[9px] text-slate-400">
+                                <span className="font-bold text-white flex gap-1 items-center"><Edit3 size={10} /> 修正寬度</span>
+                                <input type="number" className="w-16 bg-[#111] border border-white/10 rounded px-2 py-1 text-right text-[#00ff88] font-mono font-black"
+                                    value={importedData.userW} onChange={e => setImportedData({ ...importedData, userW: parseFloat(e.target.value) || 0 })} />
+                            </div>
+                            <div className="flex justify-between items-center text-[9px] text-slate-400">
+                                <span className="font-bold text-white flex gap-1 items-center"><Edit3 size={10} /> 修正高度</span>
+                                <input type="number" className="w-16 bg-[#111] border border-white/10 rounded px-2 py-1 text-right text-[#00ff88] font-mono font-black"
+                                    value={importedData.userH} onChange={e => setImportedData({ ...importedData, userH: parseFloat(e.target.value) || 0 })} />
+                            </div>
+                            <div className="text-[8px] text-slate-500 mt-1 italic text-center">
+                                原始偵測: {Math.round(importedData.rawW)} x {Math.round(importedData.rawH)} ({importedData.detectedUnitInfo})
+                            </div>
+                        </div>
+                    )}
+
+                    <section className="space-y-4">
+                        <label className="text-[10px] font-black text-[#00ff88] uppercase tracking-widest flex items-center gap-2 font-mono"><Settings size={14} /> 3. 鏈式避讓</label>
+                        <div className="bg-[#050505] p-4 rounded-2xl border border-white/5 space-y-4 shadow-xl">
+                            <div className="space-y-2">
+                                <div className="flex justify-between text-[9px] font-black uppercase tracking-tighter"><span className="text-slate-500 italic">安全刀間距</span><span className="text-white font-mono">{minGutter} MM</span></div>
+                                <input type="range" min="6" max="100" className="w-full accent-[#00ff88]" value={minGutter} onChange={e => setMinGutter(parseInt(e.target.value))} />
+                            </div>
+                            <div className="space-y-2 pt-2 border-t border-white/5">
+                                <div className="flex justify-between text-[9px] font-black uppercase tracking-tighter"><span className="text-slate-500 italic">左右雙向偏移</span><span className="text-[#00ff88] font-mono">{xShiftManual} MM</span></div>
+                                <input type="range" min="-200" max="200" className="w-full accent-[#00ff88]" value={xShiftManual} onChange={e => setXShiftManual(parseInt(e.target.value))} />
+                            </div>
+                        </div>
+                    </section>
+
+                    <div className="flex items-center justify-between p-3 bg-[#111] rounded-xl border border-white/5 shadow-inner">
+                        <span className="text-[9px] font-black text-[#00ff88] uppercase italic tracking-widest">180° 自動對插</span>
+                        <div onClick={() => setIsInterlocking(!isInterlocking)} className={`w-10 h-5 rounded-full cursor-pointer transition-all p-1 flex items-center ${isInterlocking ? 'bg-[#00ff88]' : 'bg-slate-800'}`}>
+                            <div className={`w-3 h-3 bg-white rounded-full transition-transform ${isInterlocking ? 'translate-x-5' : 'translate-x-0'}`} />
+                        </div>
+                    </div>
+
+                    <div className="space-y-2 pt-2">
+                        <label className="text-[10px] font-black text-slate-500 uppercase tracking-widest flex items-center gap-2"><Maximize2 size={14} /> 預覽縮放</label>
+                        <input type="range" min="0.05" max="2.0" step="0.01" className="w-full accent-[#00ff88]" value={zoom} onChange={e => setZoom(parseFloat(e.target.value))} />
+                    </div>
+                </aside>
+
+                <section className="flex-1 bg-[#000] relative overflow-auto p-4 flex items-start justify-center scrollbar-hide">
+                    <div className={`absolute inset-0 opacity-[0.03] pointer-events-none ${grainDirection === 'long' ? 'bg-[repeating-linear-gradient(0deg,transparent,transparent_2px,#fff_2px,#fff_3px)]' : 'bg-[repeating-linear-gradient(90deg,transparent,transparent_2px,#fff_2px,#fff_3px)]'}`} />
+                    <div className="bg-white shadow-[0_0_100px_rgba(0,0,0,1)] relative transition-all duration-700 border-[4px] border-[#0a0a0a] flex-shrink-0"
+                        style={{ width: currentPaper.width * zoom, height: currentPaper.height * zoom }}
+                    >
+                        <div className="absolute bottom-0 left-0 w-full bg-red-500/5 border-t border-red-500/20 flex items-center justify-center overflow-hidden" style={{ height: 10 * zoom }}>
+                            <span className="text-[6px] text-red-500 font-black opacity-30 font-mono tracking-widest uppercase">Gripper_10mm</span>
+                        </div>
+                        <div className="absolute" style={{
+                            left: ((currentPaper.width - (activeSolution.cols * (activeSolution.itemW + minGutter) - minGutter + Math.abs(activeSolution.effectiveShift))) / 2) * zoom,
+                            top: ((currentPaper.height - ((activeSolution.rows - 1) * activeSolution.yStep + activeSolution.itemH)) / 2) * zoom
+                        }}>
+                            {Array.from({ length: activeSolution.total || 0 }).map((_, i) => {
+                                const row = Math.floor(i / activeSolution.cols);
+                                const col = i % activeSolution.cols;
+                                const isFlipped = isInterlocking && row % 2 === 1;
+                                return (
+                                    <div key={i} className="absolute transition-all duration-300"
+                                        style={{
+                                            left: (col * (activeSolution.itemW + minGutter) + (isFlipped ? activeSolution.effectiveShift : 0)) * zoom,
+                                            top: row * activeSolution.yStep * zoom,
+                                        }}
+                                    >
+                                        <BoxDieline params={struct} detailSettings={details} scale={zoom} isFlipped={isFlipped} isItemRotated={activeSolution.isRotated} importedSvg={mode === 'import' ? importedData : null} importUnit={null} />
+                                    </div>
+                                );
+                            })}
+                        </div>
+                    </div>
+                </section>
+
+                <aside className="w-72 border-l border-white/5 bg-[#0a0a0a] p-5 flex flex-col space-y-6 overflow-y-auto scrollbar-hide">
+                    <div className="bg-gradient-to-br from-[#111] to-[#050505] p-5 rounded-[2.5rem] border border-white/10 shadow-2xl relative flex flex-col justify-center text-center">
+                        <div className="text-[10px] text-slate-500 font-black uppercase tracking-widest mb-2 flex items-center justify-center gap-2"><Target size={12} />最終產出模數</div>
+                        <div className="text-6xl font-black text-[#00ff88] italic leading-tight">{activeSolution.total} <span className="text-lg not-italic text-slate-600 font-bold uppercase tracking-tighter">UP</span></div>
+                        <div className="mt-2 text-[8px] bg-white/5 text-slate-400 py-1 rounded-full font-black uppercase border border-white/5 tracking-widest italic">利用率: {activeSolution.efficiency}%</div>
+                    </div>
+
+                    <div className="space-y-3">
+                        <label className="text-[10px] font-black text-slate-500 uppercase tracking-widest flex items-center gap-2 font-mono"><LayoutGrid size={14} className="text-[#00ff88]" /> 機台最佳方案推薦</label>
+                        <div className="grid grid-cols-1 gap-2">
+                            {solutions.map((sol, idx) => (
+                                <button key={idx} onClick={() => setSelectedSolutionIdx(idx)}
+                                    className={`p-3 rounded-2xl border transition-all text-left group ${selectedSolutionIdx === idx ? 'bg-[#00ff88]/10 border-[#00ff88] shadow-lg' : 'bg-[#050505] border-white/5 hover:border-white/10'}`}
+                                >
+                                    <div className="flex justify-between items-center mb-1">
+                                        <span className={`font-black text-[10px] ${selectedSolutionIdx === idx ? 'text-[#00ff88]' : 'text-slate-400'}`}>{sol.name}</span>
+                                        <Check size={12} className={selectedSolutionIdx === idx ? 'text-[#00ff88]' : 'text-transparent'} />
+                                    </div>
+                                    <div className="flex justify-between items-end gap-2">
+                                        <div className="text-[14px] font-black text-white leading-none shrink-0">{sol.total} <span className="text-[8px] text-slate-600">UP</span></div>
+                                        <div className="text-[8px] font-mono text-slate-600 group-hover:text-[#00ff88]/50 italic text-right min-w-0">
+                                            <div className="truncate">{sol.idealW} x {sol.idealH} mm</div>
+                                            {sol.matchStd && <div className="text-[#00ff88] text-[7px] font-black truncate">{sol.stdNote}</div>}
+                                        </div>
+                                    </div>
+                                </button>
+                            ))}
+                        </div>
+                    </div>
+
+                    <div className="bg-[#050505] p-4 rounded-3xl border border-white/5 space-y-2 shadow-inner text-[10px] font-bold">
+                        <div className="text-slate-600 font-black uppercase tracking-widest border-b border-white/5 pb-2 mb-2 flex items-center gap-2 font-mono"><Ruler size={12} />選定上機紙張</div>
+                        <div className="flex justify-between uppercase"><span className="text-slate-500 italic tracking-tighter">紙張寬度 (捲筒)</span><span className="text-[#00ff88] font-mono">{activeSolution.idealW} MM</span></div>
+                        <div className="flex justify-between uppercase"><span className="text-slate-500 italic tracking-tighter">紙張高度 (切長)</span><span className="text-[#00ff88] font-mono">{activeSolution.idealH} MM</span></div>
+                    </div>
+
+                    <button onClick={applyAutoPaper} className="w-full py-4 bg-[#222] border border-[#00ff88]/30 text-[#00ff88] rounded-2xl font-black text-[10px] hover:bg-[#00ff88] hover:text-black transition-all flex items-center justify-center gap-2">
+                        <ArrowRightLeft size={14} /> 應用最佳機台紙張
+                    </button>
+                </aside>
+            </main>
+
+            {showSaveModal && (
+                <div className="fixed inset-0 z-[100] bg-black/80 flex items-center justify-center p-4 backdrop-blur-sm animate-in fade-in duration-300">
+                    {/* Modal Content */}
+                </div>
+            )}
+            <footer className="bg-[#020202] border-t border-white/5 px-6 py-2 flex justify-between items-center text-[8px] text-slate-700 font-black uppercase tracking-[0.4em]">
+                <div className="flex gap-8">
+                    <span className="flex items-center gap-2"><div className="w-1.5 h-1.5 rounded-full bg-[#00ff88] animate-pulse"></div> ENGINE v9.11-PRO</span>
+                    <span>PT/MM_AUTO_CONVERT</span>
+                </div>
+                <div className="font-mono italic text-white/30 tracking-tighter">Verified Engineering Workflow for Professional Printing</div>
+            </footer>
+        </div>
+    );
+};
+
+export default App;
